@@ -1,0 +1,779 @@
+import pandas as pd
+import smtplib
+from email.mime.text import MIMEText
+from fredapi import Fred
+import dash
+from dash import dcc, html
+from dash.dependencies import Input, Output, State
+import plotly.graph_objs as go
+import dash_bootstrap_components as dbc
+from dash.exceptions import PreventUpdate
+import threading
+from statsmodels.tsa.api import VAR
+import numpy as np
+from statsmodels.graphics.tsaplots import plot_pacf
+import io
+import base64
+import matplotlib
+matplotlib.use('Agg')
+import matplotlib.pyplot as plt
+import logging
+from garch import run_garch, get_garch_plots
+
+# =======================
+# Configuration and Setup
+# =======================
+
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler("app.log"),
+        logging.StreamHandler()
+    ]
+)
+
+# Define your FRED API key and series IDs
+api_key = ''  # Replace with your FRED API key
+series_ids = [
+    "BAMLH0A3HYCEY",
+    "BAMLC0A4CBBBEY",
+    "BAMLC0A1CAAAEY",
+    "NASDAQ100",
+    "DGS10",
+    "BAMLHE00EHYIOAS",
+    "BAMLC0A1CAAA",
+]
+
+# Create a dictionary for user-friendly names
+series_names = {
+    "BAMLH0A3HYCEY":  "CCC Bonds",
+    "BAMLC0A4CBBBEY": "BBB Bonds",
+    "BAMLC0A1CAAAEY": "AAA Bonds",
+    "NASDAQ100": "NASDAQ100",
+    "DGS10": "10-Year Treasury Rate",
+    "BAMLHE00EHYIOAS": "European Credit Spread",
+    "BAMLC0A1CAAA": "American Credit Spread",
+}
+
+# Create a dictionary to store thresholds for each series
+thresholds = {
+    "BAMLH0A3HYCEY": 0.6,
+    "BAMLC0A4CBBBEY": 1.5,
+    "BAMLC0A1CAAAEY": 1.3,
+    "NASDAQ100": 2.5,
+    "DGS10": 0.5,
+    "BAMLHE00EHYIOAS": 1.0,
+    "BAMLC0A1CAAA": 1.0,
+    "MORTGAGE30US": 1.0
+}
+
+# Email parameters
+smtp_server = 'smtp.gmail.com'
+smtp_port = 587
+sender_email = 'your_email@example.com'  # Replace with your email
+sender_password = 'your_app_password'  # Replace with your App Password
+recipient_email = 'recipient_email@example.com'  # Replace with recipient's email
+
+# Initialize FRED instance
+fred = Fred(api_key=api_key)
+
+# Dictionary to store mean and std for each series
+data_stats = {}
+
+# =======================
+# Helper Functions
+# =======================
+
+def send_email_alert(instrument_name, threshold, current_value):
+    subject = f"Alert: {instrument_name} crossed the threshold!"
+    body = (f"The instrument {instrument_name} has crossed the threshold of {threshold}.\n"
+            f"Current standardized value: {current_value}")
+    msg = MIMEText(body)
+    msg['Subject'] = subject
+    msg['From'] = sender_email
+    msg['To'] = recipient_email
+
+    try:
+        with smtplib.SMTP(smtp_server, smtp_port) as server:
+            server.starttls()
+            server.login(sender_email, sender_password)
+            server.sendmail(sender_email, recipient_email, msg.as_string())
+        logging.info(f"Email sent successfully to {recipient_email} for {instrument_name}")
+    except Exception as e:
+        logging.error(f"Failed to send email for {instrument_name}: {e}")
+
+def fetch_all_data():
+    data_dict = {}
+    for series in series_ids:
+        try:
+            logging.info(f"Fetching data for series: {series}")
+            data = fred.get_series(series)
+            df = pd.DataFrame(data, columns=[series])
+            df['date'] = pd.to_datetime(df.index)
+            df.set_index('date', inplace=True)
+            data_dict[series] = df
+            latest_date = df.index.max()
+            logging.info(f"Fetched {series} up to {latest_date.strftime('%Y-%m-%d')}")
+        except Exception as e:
+            logging.error(f"Error fetching {series}: {e}")
+            data_dict[series] = pd.DataFrame(columns=[series])
+
+    # Align frequencies
+    data_frames = [df for df in data_dict.values() if not df.empty]
+    if data_frames:
+        # Determine the target frequency (e.g., 'B' for business days)
+        target_frequency = 'B'  # You can change this to 'W' for weekly, 'D' for daily, etc.
+
+        # Resample all series to the target frequency
+        aligned_frames = []
+        for df in data_frames:
+            df = df.asfreq(target_frequency).ffill().bfill()
+            aligned_frames.append(df)
+            logging.info(f"Resampled {df.columns[0]} to frequency {target_frequency}")
+
+        # Merge all data
+        merged_data = pd.concat(aligned_frames, axis=1).dropna()
+        if not merged_data.empty:
+            logging.info(f"Merged data columns before reset_index(): {merged_data.columns.tolist()}")
+            merged_data.index = pd.to_datetime(merged_data.index)
+            merged_data.index.freq = target_frequency
+            data_dict['merged_data'] = merged_data.reset_index()
+            if 'date' in data_dict['merged_data'].columns:
+                logging.info(f"Merged data up to {data_dict['merged_data']['date'].max().strftime('%Y-%m-%d')}")
+            else:
+                logging.error("Merged data does not contain 'date' column after reset_index()")
+        else:
+            data_dict['merged_data'] = pd.DataFrame()
+            logging.warning("Merged data is empty after dropna()")
+    else:
+        data_dict['merged_data'] = pd.DataFrame()
+        logging.warning("No data frames to merge")
+
+    # DEBUG LOG: After merging data
+    if 'merged_data' in data_dict and not data_dict['merged_data'].empty:
+        logging.info("Tail of merged_data:")
+        logging.info(data_dict['merged_data'].tail())
+    else:
+        logging.warning("merged_data is empty or not present.")
+
+    return data_dict
+
+data_cache = fetch_all_data()
+
+def calculate_first_difference_and_standardize(data, columns):
+    for column in columns:
+        if column not in data.columns:
+            logging.warning(f"Column {column} not found in data.")
+            continue
+
+        differenced = data[column].diff().dropna()
+        data[f'{column}_diff'] = differenced
+
+        mean = differenced.mean()
+        std = differenced.std()
+        standardized_diff = (differenced - mean) / std
+        data[f'{column}_diff_zscore'] = standardized_diff
+
+        data_stats[column] = {'mean': mean, 'std': std}
+
+        threshold = thresholds.get(column, None)
+        if threshold is None:
+            logging.warning(f"No threshold set for {column}.")
+            continue
+
+        latest_value = standardized_diff.iloc[-1]
+        logging.info(f"{column} latest z-score: {latest_value}")
+        if abs(latest_value) > threshold:
+            instrument_name = series_names.get(column, column)
+            logging.info(f"{instrument_name} crossed the threshold: {latest_value} > {threshold}")
+            threading.Thread(target=send_email_alert, args=(instrument_name, threshold, latest_value)).start()
+
+    return data
+
+def create_plotly_graph(data, column, friendly_name, threshold):
+    trace = go.Scatter(
+        x=data['date'],
+        y=data[f'{column}_diff_zscore'],
+        mode='lines',
+        name=f'{friendly_name} Z-Score',
+        line=dict(color='blue')
+    )
+
+    layout = go.Layout(
+        title=f'Standardized First Difference of {friendly_name}',
+        xaxis={'title': 'Date'},
+        yaxis={'title': 'Standardized Value (Z-Score)'},
+        shapes=[
+            {
+                'type': 'line',
+                'x0': data['date'].min(),
+                'x1': data['date'].max(),
+                'y0': threshold,
+                'y1': threshold,
+                'line': {
+                    'color': 'red',
+                    'width': 2,
+                    'dash': 'dash'
+                }
+            },
+            {
+                'type': 'line',
+                'x0': data['date'].min(),
+                'x1': data['date'].max(),
+                'y0': -threshold,
+                'y1': -threshold,
+                'line': {
+                    'color': 'red',
+                    'width': 2,
+                    'dash': 'dash'
+                }
+            }
+        ],
+        hovermode='closest'
+    )
+
+    return {'data': [trace], 'layout': layout}
+
+def fit_var_model(model_data, lags=15):
+    initial_values = model_data.iloc[-1].to_dict()
+    model = VAR(model_data)
+    results = model.fit(maxlags=lags, ic='aic')
+    return results, initial_values
+
+def invert_standardization(forecast_z, series):
+    if series not in data_stats:
+        logging.warning(f"No standardization stats for {series}.")
+        return forecast_z
+
+    mean = data_stats[series]['mean']
+    std = data_stats[series]['std']
+    forecast_diff = forecast_z * std + mean  # Renamed variable
+    return forecast_diff
+
+def invert_first_difference(forecast_diff, last_value):
+    """
+    Inverts the first differences to obtain forecasted values.
+    """
+    forecast = forecast_diff.copy()
+    forecast_values = []
+    forecast_values.append(last_value + forecast_diff.iloc[0])
+    for diff in forecast_diff.iloc[1:]:
+        new_value = forecast_values[-1] + diff
+        forecast_values.append(new_value)
+    return pd.Series(forecast_values, index=forecast_diff.index)
+
+def create_forecast_plot(forecast_df, target_series, data):
+    traces = []
+
+    traces.append(go.Scatter(
+        x=data.index,
+        y=data[target_series],
+        mode='lines',
+        name=f'{series_names.get(target_series, target_series)} Historical'
+    ))
+
+    traces.append(go.Scatter(
+        x=forecast_df.index,
+        y=forecast_df[target_series],
+        mode='lines',
+        name=f'{series_names.get(target_series, target_series)} Forecast',
+        line=dict(dash='dash')
+    ))
+
+    layout = go.Layout(
+        title=f'VAR Model Forecast for {series_names.get(target_series, target_series)}',
+        xaxis={'title': 'Date'},
+        yaxis={'title': 'Values'},
+        hovermode='closest'
+    )
+
+    return {'data': traces, 'layout': layout}
+
+def compute_irf(results, periods=10, shock=1.0):
+    irf = results.irf(periods)
+    irf_effect = irf.irfs * shock
+    return irf_effect
+
+def create_irf_plot(irf):
+    fig = irf.plot(orth=False)
+    plt.tight_layout()
+
+    buf = io.BytesIO()
+    fig.savefig(buf, format='png')
+    buf.seek(0)
+    image_base64 = base64.b64encode(buf.read()).decode('utf-8')
+    plt.close(fig)
+
+    return {
+        'data': [],
+        'layout': {
+            'images': [{
+                'source': 'data:image/png;base64,{}'.format(image_base64),
+                'xref': 'paper',
+                'yref': 'paper',
+                'x': 0,
+                'y': 1,
+                'sizex': 1,
+                'sizey': 1,
+                'sizing': 'stretch',
+                'opacity': 1,
+                'layer': 'below'
+            }],
+            'xaxis': {'visible': False},
+            'yaxis': {'visible': False},
+            'margin': {'l': 0, 'r': 0, 't': 40, 'b': 0}
+        }
+    }
+
+def generate_pacf_plot(data, target_series):
+    # Calculate first difference for PACF
+    series_data = data[target_series].diff().dropna()
+
+    fig, ax = plt.subplots(figsize=(8, 4))
+    plot_pacf(series_data, ax=ax, lags=20, method='ywm')
+    ax.set_title(f'PACF of First Difference in {series_names.get(target_series, target_series)}')
+
+    buf = io.BytesIO()
+    plt.savefig(buf, format='png')
+    buf.seek(0)
+    image_base64 = base64.b64encode(buf.read()).decode('utf-8')
+    plt.close(fig)
+
+    return {
+        'data': [],
+        'layout': {
+            'images': [{
+                'source': 'data:image/png;base64,{}'.format(image_base64),
+                'xref': 'paper',
+                'yref': 'paper',
+                'x': 0,
+                'y': 1,
+                'sizex': 1,
+                'sizey': 1,
+                'sizing': 'stretch',
+                'opacity': 1,
+                'layer': 'below'
+            }],
+            'xaxis': {'visible': False},
+            'yaxis': {'visible': False},
+            'margin': {'l': 0, 'r': 0, 't': 40, 'b': 0}
+        }
+    }
+
+# =======================
+# Dash App Initialization
+# =======================
+
+app = dash.Dash(__name__, external_stylesheets=[dbc.themes.BOOTSTRAP])
+app.title = "ChoppedCheese Dash"
+
+# =======================
+# Layout Definition
+# =======================
+
+app.layout = dbc.Container([
+    html.H1("ChoppedCheese Dash", className='text-center my-4'),
+
+    dcc.Store(id='var-forecast-store'),
+
+    dbc.Row([
+        dbc.Col([
+            html.Div([
+                html.Label("Select Dataset"),
+                dcc.Dropdown(
+                    id='dataset-dropdown',
+                    options=[{'label': series_names[key], 'value': key} for key in series_ids],
+                    value=series_ids[0],
+                    clearable=False
+                ),
+                html.Div([
+                    html.Label("Set Threshold"),
+                    dcc.Input(
+                        id='threshold-input',
+                        type='number',
+                        value=thresholds.get(series_ids[0], 1.0),
+                        step=0.1,
+                        min=0,
+                        style={'width': '100%'}
+                    )
+                ], style={'margin-top': '10px'}),
+                dcc.Graph(id='threshold-graph')
+            ], style={'padding': '20px', 'border': '1px solid #ccc', 'border-radius': '5px'})
+        ], width=6),
+
+        dbc.Col([
+            html.Div([
+                html.H4("Partial Autocorrelation Function (PACF)", className='text-center'),
+                html.Label("Select Target Series for PACF"),
+                dcc.Dropdown(
+                    id='var-target-dropdown-pacf',
+                    options=[{'label': series_names[key], 'value': key} for key in series_ids],
+                    value=series_ids[0],
+                    clearable=False
+                ),
+                html.Button('Generate PACF Plot', id='generate-pacf-button', n_clicks=0, style={'margin-top': '10px'}),
+                dcc.Graph(id='pacf-graph')
+            ], style={'padding': '20px', 'border': '1px solid #ccc', 'border-radius': '5px'})
+        ], width=6)
+    ], className='mb-4'),
+
+    dbc.Row([
+        dbc.Col([
+            html.Div([
+                html.H4("VAR Forecasts", className='text-center'),
+                html.Label("Select Target Series"),
+                dcc.Dropdown(
+                    id='var-target-dropdown',
+                    options=[{'label': series_names[key], 'value': key} for key in series_ids],
+                    value=series_ids[0],
+                    clearable=False
+                ),
+                html.Label("Select Dependent Variables"),
+                dcc.Dropdown(
+                    id='var-dependents-dropdown',
+                    options=[{'label': series_names[key], 'value': key} for key in series_ids],
+                    value=series_ids[1:3],
+                    multi=True
+                ),
+                html.Label("Select Number of Lags"),
+                dcc.Input(
+                    id='var-lags-input',
+                    type='number',
+                    value=15,
+                    step=1,
+                    min=1,
+                    style={'width': '100%'}
+                ),
+                html.Button('Initialize VAR Model', id='initialize-var-button', n_clicks=0, style={'margin-top': '10px'}),
+                dcc.Graph(id='var-forecast-graph')
+            ], style={'padding': '20px', 'border': '1px solid #ccc', 'border-radius': '5px'})
+        ], width=6),
+
+        dbc.Col([
+            html.Div([
+                html.H4("Impulse Response Function (IRF)", className='text-center'),
+                html.Div([
+                    html.Label("Uses the VAR model from the Forecast section."),
+                    html.Label("Select Number of Periods"),
+                    dcc.Input(
+                        id='irf-periods-input',
+                        type='number',
+                        value=10,
+                        step=1,
+                        min=1,
+                        style={'width': '100%'}
+                    ),
+                    html.Label("Select Shock Value"),
+                    dcc.Slider(
+                        id='irf-shock-slider',
+                        min=-2.0,
+                        max=2.0,
+                        step=0.1,
+                        value=1.0,
+                        marks={-2.0: '-2.0', -1.0: '-1.0', 0.0: '0.0', 1.0: '1.0', 2.0: '2.0'},
+                        tooltip={"placement": "bottom", "always_visible": True}
+                    ),
+                ], style={'margin-top': '10px'}),
+                dcc.Graph(id='irf-graph')
+            ], style={'padding': '20px', 'border': '1px solid #ccc', 'border-radius': '5px'})
+        ], width=6)
+    ], className='mb-4'),
+
+    dbc.Row([
+        dbc.Col([
+            html.Div([
+                html.H4("GARCH Model", className='text-center'),
+                html.Label("Select Target Variable"),
+                dcc.Dropdown(
+                    id='garch-target-dropdown',
+                    options=[{'label': series_names[key], 'value': key} for key in series_ids],
+                    value=series_ids[0],
+                    clearable=False
+                ),
+                html.Label("Select Dependent Variables"),
+                dcc.Dropdown(
+                    id='garch-dependents-dropdown',
+                    options=[{'label': series_names[key], 'value': key} for key in series_ids],
+                    value=series_ids[1:3],
+                    multi=True
+                ),
+                html.Button('Run GARCH Model', id='run-garch-button', n_clicks=0, style={'margin-top': '10px'}),
+                html.Img(id='garch-plot', style={'width': '100%', 'margin-top': '20px'})
+            ], style={'padding': '20px', 'border': '1px solid #ccc', 'border-radius': '5px'})
+        ], width=12)
+    ], className='mb-4'),
+
+    dbc.Row([
+        dbc.Col([
+            html.Div([
+                html.Button('Send Test Email', id='send-test-email-button', n_clicks=0),
+                html.Div(id='email-test-output', style={'margin-top': '10px'})
+            ], style={'padding': '20px', 'border': '1px solid #ccc', 'border-radius': '5px'})
+        ], width=12)
+    ], className='mb-4')
+
+], fluid=True)
+
+# =======================
+# Callback Definitions
+# =======================
+
+@app.callback(
+    Output('threshold-graph', 'figure'),
+    [
+        Input('dataset-dropdown', 'value'),
+        Input('threshold-input', 'value')
+    ]
+)
+def update_threshold_graph(selected_dataset, threshold):
+    if not selected_dataset or 'merged_data' not in data_cache:
+        raise PreventUpdate
+
+    data = data_cache['merged_data'][['date', selected_dataset]].copy()
+    if data.empty:
+        logging.warning(f"No data available for {selected_dataset} to plot.")
+        return go.Figure()
+
+    data = calculate_first_difference_and_standardize(data, [selected_dataset])  # Updated function name and logic
+
+    thresholds[selected_dataset] = threshold
+    logging.info(f"Threshold for {selected_dataset} set to {threshold}")
+
+    friendly_name = series_names.get(selected_dataset, selected_dataset)
+    figure = create_plotly_graph(data, selected_dataset, friendly_name, threshold)
+    logging.info(f"Updated threshold graph for {selected_dataset}")
+    return figure
+
+@app.callback(
+    Output('pacf-graph', 'figure'),
+    [
+        Input('generate-pacf-button', 'n_clicks')
+    ],
+    [
+        State('var-target-dropdown-pacf', 'value')
+    ]
+)
+def update_pacf_graph(n_clicks, target_series):
+    if n_clicks == 0 or not target_series:
+        raise PreventUpdate
+
+    data = data_cache['merged_data'].copy()
+    if data.empty or target_series not in data.columns:
+        logging.warning(f"No data available for PACF plot of {target_series}")
+        return go.Figure()
+
+    data.set_index('date', inplace=True)
+
+    figure = generate_pacf_plot(data, target_series)
+    logging.info(f"Generated PACF plot for {target_series}")
+    return figure
+
+@app.callback(
+    Output('var-forecast-store', 'data'),
+    [
+        Input('initialize-var-button', 'n_clicks')
+    ],
+    [
+        State('var-target-dropdown', 'value'),
+        State('var-dependents-dropdown', 'value'),
+        State('var-lags-input', 'value')
+    ]
+)
+def compute_var_forecast(n_clicks, target_series, dependent_series, lags):
+    if n_clicks == 0 or not target_series or not dependent_series:
+        raise PreventUpdate
+
+    selected_series = [target_series] + dependent_series
+    logging.info(f"Initializing VAR model with target: {target_series} and dependents: {dependent_series} with lags: {lags}")
+
+    data = data_cache['merged_data'][['date'] + selected_series].copy()
+    if data.empty:
+        logging.warning("No data available for VAR forecast.")
+        return {}
+
+    data.set_index('date', inplace=True)
+
+    data = calculate_first_difference_and_standardize(data, selected_series)  # Updated function name and logic
+
+    # DEBUG LOG: Before preparing VAR model input
+    logging.info("Data after first difference and standardization:")
+    logging.info(data.tail())
+
+    model_data = data[[f'{series}_diff_zscore' for series in selected_series]].dropna()
+    model_data.columns = selected_series
+
+    # DEBUG LOG: Before calling fit_var_model
+    logging.info("Model data before VAR fitting:")
+    logging.info(model_data.tail())
+
+    try:
+        results, initial_values = fit_var_model(model_data, lags=lags)
+        logging.info("VAR model fitted successfully.")
+        # DEBUG LOG: After fitting the VAR model
+        logging.info("VAR Model Summary:")
+        logging.info(results.summary())
+        logging.info("Last 5 endogenous data points used in the VAR model:")
+        logging.info(results.model.endog[-5:])
+    except Exception as e:
+        logging.error(f"Error fitting VAR model: {e}")
+        return {}
+
+    lag_order = results.k_ar
+    forecast_input = results.model.endog[-lag_order:]
+    forecast_z = results.forecast(y=forecast_input, steps=10)
+
+    forecast_df = pd.DataFrame(forecast_z, columns=results.names)
+
+    for series in results.names:
+        forecast_diff = invert_standardization(forecast_df[series], series)  # Updated inversion
+        last_value = data[series].iloc[-1]
+        forecast_original = invert_first_difference(pd.Series(forecast_diff, index=forecast_df.index), last_value)  # Updated inversion
+        forecast_df[series] = forecast_original
+        logging.info(f"Forecasted values for {series} computed.")
+
+    if isinstance(data.index, pd.DatetimeIndex):
+        last_date = data.index[-1]
+        freq = data.index.freqstr
+        if freq is None:
+            freq = pd.infer_freq(data.index)
+            if freq is None:
+                freq = 'B'
+        offset = pd.tseries.frequencies.to_offset(freq)
+        forecast_index = pd.date_range(start=last_date + offset, periods=10, freq=freq)
+    else:
+        forecast_index = np.arange(len(data) + 1, len(data) + 11)
+
+    forecast_df.index = forecast_index
+
+    # DEBUG LOG: Forecast index generation
+    logging.info(f"Forecast index set from {forecast_index[0]} to {forecast_index[-1]}")
+
+    forecast_json = forecast_df.to_json(date_format='iso')
+
+    return {
+        'forecast': forecast_json,
+        'target_series': target_series,
+        'selected_series': selected_series
+    }
+
+@app.callback(
+    Output('var-forecast-graph', 'figure'),
+    [
+        Input('var-forecast-store', 'data')
+    ]
+)
+def update_var_forecast_graph(data):
+    if not data:
+        raise PreventUpdate
+
+    forecast_json = data.get('forecast', None)
+    target_series = data.get('target_series', None)
+    selected_series = data.get('selected_series', None)
+
+    if not forecast_json or not target_series or not selected_series:
+        logging.warning("Incomplete VAR forecast data received.")
+        return go.Figure()
+
+    forecast_df = pd.read_json(forecast_json, convert_dates=True)
+
+    data_plot = data_cache['merged_data'][['date'] + [target_series]].copy()
+    data_plot.set_index('date', inplace=True)
+
+    figure = create_forecast_plot(forecast_df, target_series, data_plot)
+    logging.info(f"Updated VAR forecast graph for {target_series}")
+    return figure
+
+@app.callback(
+    Output('irf-graph', 'figure'),
+    [
+        Input('var-forecast-store', 'data'),
+        Input('irf-periods-input', 'value'),
+        Input('irf-shock-slider', 'value')
+    ]
+)
+def update_irf_graph(data, periods, shock):
+    if not data:
+        raise PreventUpdate
+
+    selected_series = data.get('selected_series', None)
+
+    if not selected_series:
+        logging.warning("No selected series available for IRF plot.")
+        return go.Figure()
+
+    data_df = data_cache['merged_data'][['date'] + selected_series].copy()
+    data_df.set_index('date', inplace=True)
+
+    # Update: Use percentage change instead of standardized first difference
+    data_df = data_df[selected_series].pct_change().dropna()
+
+    model_data = data_df.dropna()
+
+    try:
+        results, _ = fit_var_model(model_data)
+        logging.info("VAR model for IRF fitted successfully.")
+        # DEBUG LOG: After fitting the VAR model for IRF
+        logging.info("VAR Model Summary for IRF:")
+        logging.info(results.summary())
+    except Exception as e:
+        logging.error(f"Error fitting VAR model for IRF: {e}")
+        return go.Figure()
+
+    try:
+        irf_effect = compute_irf(results, periods=periods, shock=shock)
+        irf = results.irf(periods)
+        irf.irfs = irf_effect
+        logging.info("IRF computed successfully.")
+    except Exception as e:
+        logging.error(f"Error computing IRF: {e}")
+        return go.Figure()
+
+    figure = create_irf_plot(irf)
+    logging.info("Updated IRF graph.")
+    return figure
+
+@app.callback(
+    Output('email-test-output', 'children'),
+    [
+        Input('send-test-email-button', 'n_clicks')
+    ]
+)
+def send_test_email_callback(n_clicks):
+    if n_clicks == 0:
+        return ""
+
+    threading.Thread(target=send_email_alert, args=("Test Instrument", "Test Threshold", "Test Value")).start()
+    logging.info("Test email sent.")
+    return "Test email sent!"
+
+@app.callback(
+    Output('garch-plot', 'src'),
+    [
+        Input('run-garch-button', 'n_clicks')
+    ],
+    [
+        State('garch-target-dropdown', 'value'),
+        State('garch-dependents-dropdown', 'value')
+    ]
+)
+def run_garch_callback(n_clicks, target, dependents):
+    if n_clicks == 0 or not target or not dependents:
+        raise PreventUpdate
+
+    try:
+        garch_models, dynamic_correlations, data = run_garch(target, dependents, api_key)
+        friendly_dependents = [series_names[dep] for dep in dependents]
+        garch_plot = get_garch_plots(garch_models, dynamic_correlations, friendly_dependents, target, dependents)
+        return f'data:image/png;base64,{garch_plot}'
+    except Exception as e:
+        logging.error(f"Error running GARCH model: {e}")
+        return ""
+
+# =======================
+# Main Execution
+# =======================
+
+if __name__ == '__main__':
+    app.run_server(debug=True, threaded=True)
